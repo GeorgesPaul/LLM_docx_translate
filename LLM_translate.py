@@ -14,6 +14,7 @@ import threading
 from threading import Thread
 import time 
 import sys
+import re
 
 logging.basicConfig(filename='translation_log.txt', level=logging.DEBUG)
 CONFIG_FILE = 'translation_config.ini'
@@ -30,7 +31,13 @@ def save_config(config):
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
+def contains_words(text):
+    return len(text.strip()) > 1 and bool(re.search(r'\w', text))
+
 def translate_text(text, api_url, api_key, target_language, model, timeout=10, shutdown_flag=None):
+
+    if not contains_words(text):
+        return text  # Return the original text if it doesn't contain any word characters
 
     if shutdown_flag and shutdown_flag.is_set():
         return None
@@ -129,6 +136,7 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                             logging.error(f"Error translating text: {run.text}\nError: {str(e)}")
                             continue
 
+        # Translate text in tables
             # Translate text in tables
             for table in doc.tables:
                 for row in table.rows:
@@ -192,7 +200,7 @@ class TranslationGUI:
     def __init__(self, master):
         self.master = master
         self.master.title("Document Translator")
-        self.master.geometry("1000x500") 
+        self.master.geometry("1000x600") 
         self.config = load_config()
 
         # To handle shutdown of running threads upon GUI close
@@ -308,12 +316,12 @@ class TranslationGUI:
         self.file_frame.pack(padx=10, pady=5, fill=tk.X)
 
         ttk.Label(self.file_frame, text="Input File:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.input_entry = ttk.Entry(self.file_frame, width=95)
+        self.input_entry = ttk.Entry(self.file_frame, width=105)
         self.input_entry.grid(row=0, column=1, padx=5, pady=2)
         ttk.Button(self.file_frame, text="Browse", command=self.browse_input).grid(row=0, column=2, padx=5, pady=2)
 
         ttk.Label(self.file_frame, text="Output File:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        self.output_entry = ttk.Entry(self.file_frame, width=95)
+        self.output_entry = ttk.Entry(self.file_frame, width=105)
         self.output_entry.grid(row=1, column=1, padx=5, pady=2)
 
         # Target Language
