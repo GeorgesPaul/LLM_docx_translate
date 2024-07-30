@@ -15,6 +15,9 @@ from threading import Thread
 import time 
 import sys
 import re
+from copy import deepcopy
+from urllib.parse import urlparse
+
 
 logging.basicConfig(filename='translation_log.txt', level=logging.DEBUG)
 CONFIG_FILE = 'translation_config.ini'
@@ -35,48 +38,73 @@ def contains_words(text):
     return len(text.strip()) > 1 and bool(re.search(r'\w', text))
 
 def translate_text(text, api_url, api_key, target_language, model, timeout=10, shutdown_flag=None):
-
     if not contains_words(text):
         return text  # Return the original text if it doesn't contain any word characters
-
     if shutdown_flag and shutdown_flag.is_set():
         return None
 
+    # Determine API type based on URL
+    parsed_url = urlparse(api_url)
+    is_ollama = parsed_url.hostname in ['localhost', '127.0.0.1']
+
     prompt = f"INPUT TEXT:{text} END OF INPUT TEXT. Translate the previous text to {target_language} language. Only return the translation, no other text. No explanation."
-    
+
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
+        "Content-Type": "application/json"
     }
-    
-    payload = {
-        "prompt": prompt,
-        "max_tokens": 4096,
-        "model": model
-    }
-    
+
+    if not is_ollama:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if is_ollama:
+        payload = {
+            "model": model,
+            "prompt": prompt
+        }
+    else:  # OpenRouter
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+
     try:
         response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=timeout)
         response.raise_for_status()
         
-        full_response = ""
-        start_time = time.time()
-        for line in response.iter_lines():
-            if time.time() - start_time > timeout:
-                raise Timeout("Response streaming timed out")
-            
-            if line:
-                json_response = json.loads(line)
-                if 'response' in json_response:
-                    full_response += json_response['response']
-                if json_response.get('done', False):
-                    break
-            
-            # Reset the timer after each successful line
+        # Check if the response is a single JSON object
+        content_type = response.headers.get('Content-Type', '')
+        if 'application/json' in content_type:
+            json_response = response.json()
+            if is_ollama:
+                full_response = json_response.get('response', '')
+            else:  # OpenRouter
+                full_response = json_response.get('choices', [{}])[0].get('message', {}).get('content', '')
+        else:
+            # Handle streaming response
+            full_response = ""
             start_time = time.time()
+            for line in response.iter_lines():
+                if time.time() - start_time > timeout:
+                    raise requests.exceptions.Timeout("Response streaming timed out")
+                if line:
+                    json_response = json.loads(line)
+                    if is_ollama:
+                        if 'response' in json_response:
+                            full_response += json_response['response']
+                        if json_response.get('done', False):
+                            break
+                    else:  # OpenRouter
+                        if 'choices' in json_response and json_response['choices']:
+                            full_response += json_response['choices'][0]['message']['content']
+                        if json_response.get('done', False):
+                            break
+                # Reset the timer after each successful line
+                start_time = time.time()
         
+        print(full_response.strip())
         return full_response.strip()
-    except Timeout:
+
+    except requests.exceptions.Timeout:
         error_message = "API request timed out"
         logging.error(error_message)
         raise
@@ -93,102 +121,119 @@ def translate_text(text, api_url, api_key, target_language, model, timeout=10, s
         logging.error(error_message)
         raise
 
+def preserve_run_formatting(new_run, original_run):
+    # Preserve character formatting
+    new_run.bold = original_run.bold
+    new_run.italic = original_run.italic
+    new_run.underline = original_run.underline
+    new_run.font.strike = original_run.font.strike
+    new_run.font.subscript = original_run.font.subscript
+    new_run.font.superscript = original_run.font.superscript
+    new_run.font.size = original_run.font.size
+    new_run.font.color.rgb = original_run.font.color.rgb
+    new_run.font.highlight_color = original_run.font.highlight_color
+    new_run.font.name = original_run.font.name
+    new_run.style = original_run.style
+
+def preserve_paragraph_formatting(new_paragraph, original_paragraph):
+    # Preserve paragraph formatting
+    new_paragraph.alignment = original_paragraph.alignment
+    new_paragraph.style = original_paragraph.style
+    new_paragraph.paragraph_format.left_indent = original_paragraph.paragraph_format.left_indent
+    new_paragraph.paragraph_format.right_indent = original_paragraph.paragraph_format.right_indent
+    new_paragraph.paragraph_format.first_line_indent = original_paragraph.paragraph_format.first_line_indent
+    new_paragraph.paragraph_format.line_spacing = original_paragraph.paragraph_format.line_spacing
+    new_paragraph.paragraph_format.space_before = original_paragraph.paragraph_format.space_before
+    new_paragraph.paragraph_format.space_after = original_paragraph.paragraph_format.space_after
+    new_paragraph.paragraph_format.keep_together = original_paragraph.paragraph_format.keep_together
+    new_paragraph.paragraph_format.keep_with_next = original_paragraph.paragraph_format.keep_with_next
+    new_paragraph.paragraph_format.page_break_before = original_paragraph.paragraph_format.page_break_before
+
+def translate_paragraph(paragraph, api_url, api_key, target_language, model):
+    if paragraph.text.strip():
+        translated_text = translate_text(paragraph.text, api_url, api_key, target_language, model)
+        new_paragraph = deepcopy(paragraph)
+        new_paragraph.clear()
+        preserve_paragraph_formatting(new_paragraph, paragraph)
+        
+        new_run = new_paragraph.add_run(translated_text)
+        preserve_run_formatting(new_run, paragraph.runs[0] if paragraph.runs else None)
+        
+        paragraph._p.getparent().replace(paragraph._p, new_paragraph._p)
+        return True
+    return False
+
+def translate_table(table, api_url, api_key, target_language, model, progress_callback, processed_elements, total_elements, shutdown_flag):
+    for row in table.rows:
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                if shutdown_flag.is_set():
+                    return processed_elements
+                if translate_paragraph(paragraph, api_url, api_key, target_language, model):
+                    processed_elements += 1
+                    progress_callback(int(processed_elements / total_elements * 100), f"Translating table text: {paragraph.text[:300]}...")
+    return processed_elements
+
 def translate_document(input_file, output_file, api_url, api_key, target_language, model, progress_callback, shutdown_flag):
     input_file = Path(input_file)
     output_file = Path(output_file)
-
-    # number of characters of translation to show
-    status_char_nr = 300; 
 
     try:
         doc = Document(input_file)
 
         # Count total translatable elements
-        total_elements = sum(1 for paragraph in doc.paragraphs for run in paragraph.runs if run.text.strip())
-        total_elements += sum(1 for table in doc.tables for row in table.rows for cell in row.cells for paragraph in cell.paragraphs for run in paragraph.runs if run.text.strip())
-        total_elements += sum(1 for shape in doc.inline_shapes if shape.has_text_frame for paragraph in shape.text_frame.paragraphs for run in paragraph.runs if run.text.strip())
+        total_elements = sum(1 for paragraph in doc.paragraphs if paragraph.text.strip())
+        total_elements += sum(1 for table in doc.tables for row in table.rows for cell in row.cells for paragraph in cell.paragraphs if paragraph.text.strip())
+        total_elements += sum(1 for shape in doc.inline_shapes if shape.has_text_frame for paragraph in shape.text_frame.paragraphs if paragraph.text.strip())
         for section in doc.sections:
-            total_elements += sum(1 for paragraph in section.header.paragraphs for run in paragraph.runs if run.text.strip())
-            total_elements += sum(1 for paragraph in section.footer.paragraphs for run in paragraph.runs if run.text.strip())
+            total_elements += sum(1 for paragraph in section.header.paragraphs if paragraph.text.strip())
+            total_elements += sum(1 for paragraph in section.footer.paragraphs if paragraph.text.strip())
 
         processed_elements = 0
-        
+
         if not shutdown_flag.is_set():
             # Translate main document text
             for paragraph in doc.paragraphs:
-
                 if shutdown_flag.is_set():
                     return
-                
-                for run in paragraph.runs:
-                    
-                    if shutdown_flag.is_set():
-                        return
+                if translate_paragraph(paragraph, api_url, api_key, target_language, model):
+                    processed_elements += 1
+                    progress_callback(int(processed_elements / total_elements * 100), f"Translating: {paragraph.text[:300]}...")
 
-                    if run.text.strip():
-                        try:
-                            progress_callback(int(processed_elements / total_elements * 100), f"Translating: {run.text[:status_char_nr]}...")
-                            translated_text = translate_text(run.text, api_url, api_key, target_language, model)
-                            if translated_text:
-                                run.text = translated_text
-                            processed_elements += 1
-                        except Exception as e:
-                            logging.error(f"Error translating text: {run.text}\nError: {str(e)}")
-                            continue
-
-        # Translate text in tables
             # Translate text in tables
             for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        for paragraph in cell.paragraphs:
-                            for run in paragraph.runs:
-                                
-                                if shutdown_flag.is_set():
-                                    return
-                                
-                                if run.text.strip():
-                                    progress_callback(int(processed_elements / total_elements * 100), f"Translating table text: {run.text[:status_char_nr]}...")
-                                    run.text = translate_text(run.text, api_url, api_key, target_language, model)
-                                    processed_elements += 1
+                processed_elements = translate_table(table, api_url, api_key, target_language, model, progress_callback, processed_elements, total_elements, shutdown_flag)
 
             # Translate text in text boxes (shapes)
             for shape in doc.inline_shapes:
                 if shape.has_text_frame:
                     for paragraph in shape.text_frame.paragraphs:
-                        for run in paragraph.runs:
-
-                            if shutdown_flag.is_set():
-                                return
-
-                            if run.text.strip():
-                                progress_callback(int(processed_elements / total_elements * 100), f"Translating shape text: {run.text[:status_char_nr]}...")
-                                run.text = translate_text(run.text, api_url, api_key, target_language, model)
-                                processed_elements += 1
+                        if shutdown_flag.is_set():
+                            return
+                        if translate_paragraph(paragraph, api_url, api_key, target_language, model):
+                            processed_elements += 1
+                            progress_callback(int(processed_elements / total_elements * 100), f"Translating shape text: {paragraph.text[:300]}...")
 
             # Translate headers and footers
             for section in doc.sections:
-                for header in section.header.paragraphs:
-                    for run in header.runs:
-                        if run.text.strip():
-                            if shutdown_flag.is_set():
-                                return
-                            progress_callback(int(processed_elements / total_elements * 100), f"Translating header: {run.text[:status_char_nr]}...")
-                            run.text = translate_text(run.text, api_url, api_key, target_language, model)
-                            processed_elements += 1
-                for footer in section.footer.paragraphs:
-                    for run in footer.runs:
-                        if run.text.strip():
-                            if shutdown_flag.is_set():
-                                return
-                            progress_callback(int(processed_elements / total_elements * 100), f"Translating footer: {run.text[:status_char_nr]}...")
-                            run.text = translate_text(run.text, api_url, api_key, target_language, model)
-                            processed_elements += 1
+                for paragraph in section.header.paragraphs:
+                    if shutdown_flag.is_set():
+                        return
+                    if translate_paragraph(paragraph, api_url, api_key, target_language, model):
+                        processed_elements += 1
+                        progress_callback(int(processed_elements / total_elements * 100), f"Translating header: {paragraph.text[:300]}...")
+                
+                for paragraph in section.footer.paragraphs:
+                    if shutdown_flag.is_set():
+                        return
+                    if translate_paragraph(paragraph, api_url, api_key, target_language, model):
+                        processed_elements += 1
+                        progress_callback(int(processed_elements / total_elements * 100), f"Translating footer: {paragraph.text[:300]}...")
 
             doc.save(output_file)
             progress_callback(100, "Translation completed!")
             print(f"Successfully translated and saved: {output_file}")
-        else: # if shutdown detected
+        else:  # if shutdown detected
             return
 
     except Exception as e:
