@@ -9,8 +9,11 @@ from pathlib import Path
 import requests
 from requests.exceptions import Timeout
 import json
+import queue
 import threading
+from threading import Thread
 import time 
+import sys
 
 logging.basicConfig(filename='translation_log.txt', level=logging.DEBUG)
 CONFIG_FILE = 'translation_config.ini'
@@ -79,9 +82,13 @@ def translate_text(text, api_url, api_key, target_language, model, timeout=10):
         logging.error(error_message)
         raise
 
-def translate_document(input_file, output_file, api_url, api_key, target_language, model, progress_callback):
+def translate_document(input_file, output_file, api_url, api_key, target_language, model, progress_callback, shutdown_flag):
     input_file = Path(input_file)
     output_file = Path(output_file)
+
+    # number of characters of translation to show
+    status_char_nr = 300; 
+
     try:
         doc = Document(input_file)
 
@@ -95,61 +102,63 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
 
         processed_elements = 0
         
-        # Translate main document text
-        for paragraph in doc.paragraphs:
-            for run in paragraph.runs:
-                if run.text.strip():
-                    try:
-                        translated_text = translate_text(run.text, api_url, api_key, target_language, model)
-                        if translated_text:
-                            run.text = translated_text
-                    except Exception as e:
-                        logging.error(f"Error translating text: {run.text}\nError: {str(e)}")
-                        # Continue with the next run instead of stopping the entire process
-                        continue
-        
-        # Translate text in tables
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    # Process paragraphs within each cell
-                    for paragraph in cell.paragraphs:
+        if not shutdown_flag.is_set():
+            # Translate main document text
+            for paragraph in doc.paragraphs:
+                for run in paragraph.runs:
+                    if run.text.strip():
+                        try:
+                            progress_callback(int(processed_elements / total_elements * 100), f"Translating: {run.text[:status_char_nr]}...")
+                            translated_text = translate_text(run.text, api_url, api_key, target_language, model)
+                            if translated_text:
+                                run.text = translated_text
+                            processed_elements += 1
+                        except Exception as e:
+                            logging.error(f"Error translating text: {run.text}\nError: {str(e)}")
+                            continue
+
+            # Translate text in tables
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                if run.text.strip():
+                                    progress_callback(int(processed_elements / total_elements * 100), f"Translating table text: {run.text[:status_char_nr]}...")
+                                    run.text = translate_text(run.text, api_url, api_key, target_language, model)
+                                    processed_elements += 1
+
+            # Translate text in text boxes (shapes)
+            for shape in doc.inline_shapes:
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
                         for run in paragraph.runs:
                             if run.text.strip():
+                                progress_callback(int(processed_elements / total_elements * 100), f"Translating shape text: {run.text[:status_char_nr]}...")
                                 run.text = translate_text(run.text, api_url, api_key, target_language, model)
-                    
-                    # Process any nested tables
-                    for nested_table in cell.tables:
-                        for nested_row in nested_table.rows:
-                            for nested_cell in nested_row.cells:
-                                for paragraph in nested_cell.paragraphs:
-                                    for run in paragraph.runs:
-                                        if run.text.strip():
-                                            run.text = translate_text(run.text, api_url, api_key, target_language, model)
-        
-        # Translate text in text boxes (shapes)
-        for shape in doc.inline_shapes:
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    for run in paragraph.runs:
+                                processed_elements += 1
+
+            # Translate headers and footers
+            for section in doc.sections:
+                for header in section.header.paragraphs:
+                    for run in header.runs:
                         if run.text.strip():
+                            progress_callback(int(processed_elements / total_elements * 100), f"Translating header: {run.text[:status_char_nr]}...")
                             run.text = translate_text(run.text, api_url, api_key, target_language, model)
-        
-        # Translate headers and footers
-        for section in doc.sections:
-            for header in section.header.paragraphs:
-                for run in header.runs:
-                    if run.text.strip():
-                        run.text = translate_text(run.text, api_url, api_key, target_language, model)
-            for footer in section.footer.paragraphs:
-                for run in footer.runs:
-                    if run.text.strip():
-                        run.text = translate_text(run.text, api_url, api_key, target_language, model)
-        
-        doc.save(output_file)
-        progress_callback(100, "Translation completed!")
-        print(f"Successfully translated and saved: {output_file}")
-    
+                            processed_elements += 1
+                for footer in section.footer.paragraphs:
+                    for run in footer.runs:
+                        if run.text.strip():
+                            progress_callback(int(processed_elements / total_elements * 100), f"Translating footer: {run.text[:status_char_nr]}...")
+                            run.text = translate_text(run.text, api_url, api_key, target_language, model)
+                            processed_elements += 1
+
+            doc.save(output_file)
+            progress_callback(100, "Translation completed!")
+            print(f"Successfully translated and saved: {output_file}")
+        else: # if shutdown detected
+            return
+
     except Exception as e:
         error_message = f"Error in translate_document: {str(e)}"
         logging.error(error_message)
@@ -162,6 +171,10 @@ class TranslationGUI:
         self.master.geometry("1000x500") 
         self.config = load_config()
 
+        # To handle shutdown of running threads upon GUI close
+        self.shutdown_flag = threading.Event()
+        self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         self.create_widgets()
         self.load_api_list()
         self.load_target_language()
@@ -173,8 +186,10 @@ class TranslationGUI:
         self.progress_bar.pack(padx=10, pady=5, fill=tk.X)
         
         self.status_var = tk.StringVar()
-        self.status_label = ttk.Label(self.master, textvariable=self.status_var)
+        self.status_label = ttk.Label(self.master, textvariable=self.status_var, width = 300)
         self.status_label.pack(padx=10, pady=5)
+
+        self.queue = queue.Queue()
     
     def test_api(self):
         selection = self.api_tree.selection()
@@ -206,6 +221,11 @@ class TranslationGUI:
         finally:
             self.status_var.set("")
             self.master.update_idletasks()
+
+    def on_closing(self):
+        self.shutdown_flag.set()
+        self.master.destroy()
+        sys.exit(0)
 
     def update_progress(self, value, status):
         self.progress_var.set(value)
@@ -265,12 +285,12 @@ class TranslationGUI:
         self.file_frame.pack(padx=10, pady=5, fill=tk.X)
 
         ttk.Label(self.file_frame, text="Input File:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.input_entry = ttk.Entry(self.file_frame, width=70)
+        self.input_entry = ttk.Entry(self.file_frame, width=90)
         self.input_entry.grid(row=0, column=1, padx=5, pady=2)
         ttk.Button(self.file_frame, text="Browse", command=self.browse_input).grid(row=0, column=2, padx=5, pady=2)
 
         ttk.Label(self.file_frame, text="Output File:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        self.output_entry = ttk.Entry(self.file_frame, width=70)
+        self.output_entry = ttk.Entry(self.file_frame, width=90)
         self.output_entry.grid(row=1, column=1, padx=5, pady=2)
 
         # Target Language
@@ -361,6 +381,18 @@ class TranslationGUI:
             else:
                 messagebox.showerror("Error", f"Selected file does not exist: {input_path}")
 
+    def show_success(self, message):
+        messagebox.showinfo("Success", message)
+        if self.open_var.get():
+            os.startfile(str(output_file))
+
+    def show_error(self, message):
+        messagebox.showerror("Error", message)
+
+    def reset_progress(self):
+        self.progress_var.set(0)
+        self.status_var.set("")
+
     def do_translation(self):
         input_file = Path(self.input_entry.get())
         output_file = Path(self.output_entry.get())
@@ -396,22 +428,45 @@ class TranslationGUI:
         self.config['Settings']['target_language'] = target_language
         save_config(self.config)
 
+        def queue_callback(value, status):
+            self.master.after(0, lambda: self.update_progress(value, status))
+
         def translation_thread():
             try:
-                translate_document(input_file, output_file, url, key, target_language, model, self.update_progress)
-                messagebox.showinfo("Success", "Translation complete!")
-                if self.open_var.get():
-                    os.startfile(str(output_file))
+                translate_document(input_file, output_file, url, key, target_language, model, queue_callback, self.shutdown_flag)
+                self.master.after(0, lambda: self.show_success("Translation complete!"))
             except Exception as e:
                 error_message = f"An error occurred: {str(e)}"
                 logging.error(error_message)
-                messagebox.showerror("Error", error_message)
+                self.master.after(0, lambda: self.show_error(error_message))
             finally:
-                self.progress_var.set(0)
-                self.status_var.set("")
-        
-        thread = threading.Thread(target=translation_thread)
+                self.master.after(0, self.reset_progress)
+
+        def check_queue():
+            try:
+                while True:
+                    value, status = self.queue.get_nowait()
+                    if value == "success":
+                        self.show_success()
+                        self.reset_progress()
+                        break
+                    elif value == "error":
+                        self.show_error()
+                        self.reset_progress()
+                        break
+                    else:
+                        self.update_progress(value, status)
+            except queue.Empty:
+                pass
+            finally:
+                if not self.queue.empty():
+                    self.master.after(100, check_queue)
+                else:
+                    self.reset_progress()
+
+        thread = Thread(target=translation_thread)
         thread.start()
+        self.master.after(100, check_queue)
 
     def on_api_select(self, event):
         selection = self.api_tree.selection()
@@ -431,3 +486,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = TranslationGUI(root)
     root.mainloop()
+    sys.exit(0)
