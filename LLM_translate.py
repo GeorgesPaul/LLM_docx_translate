@@ -30,7 +30,11 @@ def save_config(config):
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
-def translate_text(text, api_url, api_key, target_language, model, timeout=10):
+def translate_text(text, api_url, api_key, target_language, model, timeout=10, shutdown_flag=None):
+
+    if shutdown_flag and shutdown_flag.is_set():
+        return None
+
     prompt = f"INPUT TEXT:{text} END OF INPUT TEXT. Translate the previous text to {target_language} language. Only return the translation, no other text. No explanation."
     
     headers = {
@@ -105,7 +109,15 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
         if not shutdown_flag.is_set():
             # Translate main document text
             for paragraph in doc.paragraphs:
+
+                if shutdown_flag.is_set():
+                    return
+                
                 for run in paragraph.runs:
+                    
+                    if shutdown_flag.is_set():
+                        return
+
                     if run.text.strip():
                         try:
                             progress_callback(int(processed_elements / total_elements * 100), f"Translating: {run.text[:status_char_nr]}...")
@@ -123,6 +135,10 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                     for cell in row.cells:
                         for paragraph in cell.paragraphs:
                             for run in paragraph.runs:
+                                
+                                if shutdown_flag.is_set():
+                                    return
+                                
                                 if run.text.strip():
                                     progress_callback(int(processed_elements / total_elements * 100), f"Translating table text: {run.text[:status_char_nr]}...")
                                     run.text = translate_text(run.text, api_url, api_key, target_language, model)
@@ -133,6 +149,10 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                 if shape.has_text_frame:
                     for paragraph in shape.text_frame.paragraphs:
                         for run in paragraph.runs:
+
+                            if shutdown_flag.is_set():
+                                return
+
                             if run.text.strip():
                                 progress_callback(int(processed_elements / total_elements * 100), f"Translating shape text: {run.text[:status_char_nr]}...")
                                 run.text = translate_text(run.text, api_url, api_key, target_language, model)
@@ -143,12 +163,16 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                 for header in section.header.paragraphs:
                     for run in header.runs:
                         if run.text.strip():
+                            if shutdown_flag.is_set():
+                                return
                             progress_callback(int(processed_elements / total_elements * 100), f"Translating header: {run.text[:status_char_nr]}...")
                             run.text = translate_text(run.text, api_url, api_key, target_language, model)
                             processed_elements += 1
                 for footer in section.footer.paragraphs:
                     for run in footer.runs:
                         if run.text.strip():
+                            if shutdown_flag.is_set():
+                                return
                             progress_callback(int(processed_elements / total_elements * 100), f"Translating footer: {run.text[:status_char_nr]}...")
                             run.text = translate_text(run.text, api_url, api_key, target_language, model)
                             processed_elements += 1
@@ -186,10 +210,11 @@ class TranslationGUI:
         self.progress_bar.pack(padx=10, pady=5, fill=tk.X)
         
         self.status_var = tk.StringVar()
-        self.status_label = ttk.Label(self.master, textvariable=self.status_var, width = 300)
+        self.status_label = ttk.Label(self.master, textvariable=self.status_var, wraplength = 980)
         self.status_label.pack(padx=10, pady=5)
 
         self.queue = queue.Queue()
+        self.check_queue()
     
     def test_api(self):
         selection = self.api_tree.selection()
@@ -224,8 +249,7 @@ class TranslationGUI:
 
     def on_closing(self):
         self.shutdown_flag.set()
-        self.master.destroy()
-        sys.exit(0)
+        self.master.after(3000, self.master.quit)
 
     def update_progress(self, value, status):
         self.progress_var.set(value)
@@ -393,6 +417,24 @@ class TranslationGUI:
         self.progress_var.set(0)
         self.status_var.set("")
 
+    def check_queue(self):
+        try:
+            while True:
+                task = self.queue.get_nowait()
+                if task[0] == "progress":
+                    self.update_progress(task[1], task[2])
+                elif task[0] == "success":
+                    self.show_success(task[1])
+                elif task[0] == "error":
+                    self.show_error(task[1])
+        except queue.Empty:
+            pass
+        finally:
+            if not self.queue.empty():
+                self.master.after(500, self.check_queue)
+            else:
+                self.reset_progress()
+
     def do_translation(self):
         input_file = Path(self.input_entry.get())
         output_file = Path(self.output_entry.get())
@@ -429,44 +471,21 @@ class TranslationGUI:
         save_config(self.config)
 
         def queue_callback(value, status):
-            self.master.after(0, lambda: self.update_progress(value, status))
+            self.queue.put(("progress", value, status))
 
         def translation_thread():
             try:
                 translate_document(input_file, output_file, url, key, target_language, model, queue_callback, self.shutdown_flag)
-                self.master.after(0, lambda: self.show_success("Translation complete!"))
+                if not self.shutdown_flag.is_set():
+                    self.queue.put(("success", "Translation complete!"))
             except Exception as e:
-                error_message = f"An error occurred: {str(e)}"
-                logging.error(error_message)
-                self.master.after(0, lambda: self.show_error(error_message))
-            finally:
-                self.master.after(0, self.reset_progress)
-
-        def check_queue():
-            try:
-                while True:
-                    value, status = self.queue.get_nowait()
-                    if value == "success":
-                        self.show_success()
-                        self.reset_progress()
-                        break
-                    elif value == "error":
-                        self.show_error()
-                        self.reset_progress()
-                        break
-                    else:
-                        self.update_progress(value, status)
-            except queue.Empty:
-                pass
-            finally:
-                if not self.queue.empty():
-                    self.master.after(100, check_queue)
-                else:
-                    self.reset_progress()
+                if not self.shutdown_flag.is_set():
+                    error_message = f"An error occurred: {str(e)}"
+                    logging.error(error_message)
+                    self.queue.put(("error", error_message))
 
         thread = Thread(target=translation_thread)
         thread.start()
-        self.master.after(100, check_queue)
 
     def on_api_select(self, event):
         selection = self.api_tree.selection()
