@@ -6,9 +6,16 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import configparser
 from pathlib import Path
+import requests
+from requests.exceptions import Timeout
+import json
+import threading
+import time 
 
 logging.basicConfig(filename='translation_log.txt', level=logging.DEBUG)
 CONFIG_FILE = 'translation_config.ini'
+
+LLM_response_timeout_s = 10 
 
 def load_config():
     config = configparser.ConfigParser()
@@ -20,22 +27,86 @@ def save_config(config):
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
-def translate_text(text, api_url, api_key, target_language):
-    # This is a placeholder - you'll need to implement the actual API call
-    result = "kak"
-    return result  # For now, just return a placeholder text
+def translate_text(text, api_url, api_key, target_language, model, timeout=10):
+    prompt = f"INPUT TEXT:{text} END OF INPUT TEXT. Translate the previous text to {target_language} language. Only return the translation, no other text. No explanation."
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    payload = {
+        "prompt": prompt,
+        "max_tokens": 4096,
+        "model": model
+    }
+    
+    try:
+        response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=timeout)
+        response.raise_for_status()
+        
+        full_response = ""
+        start_time = time.time()
+        for line in response.iter_lines():
+            if time.time() - start_time > timeout:
+                raise Timeout("Response streaming timed out")
+            
+            if line:
+                json_response = json.loads(line)
+                if 'response' in json_response:
+                    full_response += json_response['response']
+                if json_response.get('done', False):
+                    break
+            
+            # Reset the timer after each successful line
+            start_time = time.time()
+        
+        return full_response.strip()
+    except Timeout:
+        error_message = "API request timed out"
+        logging.error(error_message)
+        raise
+    except requests.exceptions.RequestException as e:
+        error_message = f"Request error: {str(e)}"
+        logging.error(error_message)
+        raise
+    except json.JSONDecodeError as e:
+        error_message = f"JSON decode error: {str(e)}\nResponse content: {response.text}"
+        logging.error(error_message)
+        raise
+    except Exception as e:
+        error_message = f"An unexpected error occurred: {str(e)}"
+        logging.error(error_message)
+        raise
 
-def translate_document(input_file, output_file, api_url, api_key, target_language):
+def translate_document(input_file, output_file, api_url, api_key, target_language, model, progress_callback):
     input_file = Path(input_file)
     output_file = Path(output_file)
     try:
         doc = Document(input_file)
+
+        # Count total translatable elements
+        total_elements = sum(1 for paragraph in doc.paragraphs for run in paragraph.runs if run.text.strip())
+        total_elements += sum(1 for table in doc.tables for row in table.rows for cell in row.cells for paragraph in cell.paragraphs for run in paragraph.runs if run.text.strip())
+        total_elements += sum(1 for shape in doc.inline_shapes if shape.has_text_frame for paragraph in shape.text_frame.paragraphs for run in paragraph.runs if run.text.strip())
+        for section in doc.sections:
+            total_elements += sum(1 for paragraph in section.header.paragraphs for run in paragraph.runs if run.text.strip())
+            total_elements += sum(1 for paragraph in section.footer.paragraphs for run in paragraph.runs if run.text.strip())
+
+        processed_elements = 0
         
         # Translate main document text
         for paragraph in doc.paragraphs:
             for run in paragraph.runs:
                 if run.text.strip():
-                    run.text = translate_text(run.text, api_url, api_key, target_language)
+                    try:
+                        translated_text = translate_text(run.text, api_url, api_key, target_language, model)
+                        if translated_text:
+                            run.text = translated_text
+                    except Exception as e:
+                        logging.error(f"Error translating text: {run.text}\nError: {str(e)}")
+                        # Continue with the next run instead of stopping the entire process
+                        continue
         
         # Translate text in tables
         for table in doc.tables:
@@ -45,7 +116,7 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                     for paragraph in cell.paragraphs:
                         for run in paragraph.runs:
                             if run.text.strip():
-                                run.text = translate_text(run.text, api_url, api_key, target_language)
+                                run.text = translate_text(run.text, api_url, api_key, target_language, model)
                     
                     # Process any nested tables
                     for nested_table in cell.tables:
@@ -54,7 +125,7 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                                 for paragraph in nested_cell.paragraphs:
                                     for run in paragraph.runs:
                                         if run.text.strip():
-                                            run.text = translate_text(run.text, api_url, api_key, target_language)
+                                            run.text = translate_text(run.text, api_url, api_key, target_language, model)
         
         # Translate text in text boxes (shapes)
         for shape in doc.inline_shapes:
@@ -62,69 +133,132 @@ def translate_document(input_file, output_file, api_url, api_key, target_languag
                 for paragraph in shape.text_frame.paragraphs:
                     for run in paragraph.runs:
                         if run.text.strip():
-                            run.text = translate_text(run.text, api_url, api_key, target_language)
+                            run.text = translate_text(run.text, api_url, api_key, target_language, model)
         
         # Translate headers and footers
         for section in doc.sections:
             for header in section.header.paragraphs:
                 for run in header.runs:
                     if run.text.strip():
-                        run.text = translate_text(run.text, api_url, api_key, target_language)
+                        run.text = translate_text(run.text, api_url, api_key, target_language, model)
             for footer in section.footer.paragraphs:
                 for run in footer.runs:
                     if run.text.strip():
-                        run.text = translate_text(run.text, api_url, api_key, target_language)
+                        run.text = translate_text(run.text, api_url, api_key, target_language, model)
         
         doc.save(output_file)
+        progress_callback(100, "Translation completed!")
         print(f"Successfully translated and saved: {output_file}")
     
     except Exception as e:
-        print(f"Error in translate_document: {str(e)}")
+        error_message = f"Error in translate_document: {str(e)}"
+        logging.error(error_message)
         raise
 
 class TranslationGUI:
     def __init__(self, master):
         self.master = master
         self.master.title("Document Translator")
-        self.master.geometry("800x400")
+        self.master.geometry("1000x500") 
         self.config = load_config()
 
         self.create_widgets()
         self.load_api_list()
         self.load_target_language()
+        self.api_tree.bind('<<TreeviewSelect>>', self.on_api_select)
+
+        # Add progress bar and status label
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.master, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(padx=10, pady=5, fill=tk.X)
+        
+        self.status_var = tk.StringVar()
+        self.status_label = ttk.Label(self.master, textvariable=self.status_var)
+        self.status_label.pack(padx=10, pady=5)
+    
+    def test_api(self):
+        selection = self.api_tree.selection()
+        if not selection:
+            messagebox.showerror("Error", "Please select an API to test")
+            return
+
+        item = selection[0]
+        name, model, url, key = self.api_tree.item(item, 'values')
+
+        test_prompt = "Translate the following English text to French: 'Hello, world!'"
+        
+        try:
+            self.status_var.set("Testing API connection...")
+            self.master.update_idletasks()
+
+            result = translate_text(test_prompt, url, key, "French", model, timeout=15)  # 15 seconds timeout for the test
+            
+            if result:
+                messagebox.showinfo("API Test Successful", f"API connection successful!\nResponse: {result}")
+            else:
+                messagebox.showerror("API Test Failed", "API connection failed. No response received.")
+        except Timeout:
+            messagebox.showerror("API Test Failed", "API request timed out. The server took too long to respond.")
+        except Exception as e:
+            error_message = f"API Test Failed: {str(e)}"
+            logging.error(error_message)
+            messagebox.showerror("API Test Failed", error_message)
+        finally:
+            self.status_var.set("")
+            self.master.update_idletasks()
+
+    def update_progress(self, value, status):
+        self.progress_var.set(value)
+        self.status_var.set(status)
+        self.master.update_idletasks()
 
     def create_widgets(self):
         # API List
         self.api_frame = ttk.LabelFrame(self.master, text="API Settings")
         self.api_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
-        self.api_list = tk.Listbox(self.api_frame, width=80, height=6)
-        self.api_list.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
+        # Replace Listbox with Treeview
+        self.api_tree = ttk.Treeview(self.api_frame, columns=('Name', 'Model', 'URL', 'Key'), show='headings')
+        self.api_tree.heading('Name', text='Name')
+        self.api_tree.heading('Model', text='Model')
+        self.api_tree.heading('URL', text='URL')
+        self.api_tree.heading('Key', text='Key')
+        self.api_tree.column('Name', width=100)
+        self.api_tree.column('Model', width=100)
+        self.api_tree.column('URL', width=300)
+        self.api_tree.column('Key', width=100)
+        self.api_tree.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
 
-        self.scroll = ttk.Scrollbar(self.api_frame, orient=tk.VERTICAL, command=self.api_list.yview)
+        self.scroll = ttk.Scrollbar(self.api_frame, orient=tk.VERTICAL, command=self.api_tree.yview)
         self.scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.api_list.config(yscrollcommand=self.scroll.set)
+        self.api_tree.configure(yscrollcommand=self.scroll.set)
 
         self.delete_button = ttk.Button(self.api_frame, text="Delete Selected", command=self.delete_api)
-        self.delete_button.pack(side=tk.RIGHT, padx=5, pady=5)
+        self.delete_button.pack(side=tk.BOTTOM, padx=5, pady=5)
 
         # Add API
         self.add_frame = ttk.Frame(self.master)
         self.add_frame.pack(padx=10, pady=5, fill=tk.X)
 
         ttk.Label(self.add_frame, text="Name:").pack(side=tk.LEFT, padx=5)
-        self.name_entry = ttk.Entry(self.add_frame, width=20)
+        self.name_entry = ttk.Entry(self.add_frame, width=15)
         self.name_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(self.add_frame, text="Model:").pack(side=tk.LEFT, padx=5)
+        self.model_entry = ttk.Entry(self.add_frame, width=15)
+        self.model_entry.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(self.add_frame, text="URL:").pack(side=tk.LEFT, padx=5)
         self.url_entry = ttk.Entry(self.add_frame, width=30)
         self.url_entry.pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(self.add_frame, text="API Key:").pack(side=tk.LEFT, padx=5)
-        self.key_entry = ttk.Entry(self.add_frame, width=20, show="*")
+        ttk.Label(self.add_frame, text="API Key (optional):").pack(side=tk.LEFT, padx=5)
+        self.key_entry = ttk.Entry(self.add_frame, width=15, show="*")
         self.key_entry.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(self.add_frame, text="Add API", command=self.add_api).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.add_frame, text="Edit API", command=self.edit_api).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.add_frame, text="Test API", command=self.test_api).pack(side=tk.LEFT, padx=5)
 
         # File Selection
         self.file_frame = ttk.Frame(self.master)
@@ -155,8 +289,8 @@ class TranslationGUI:
     def load_api_list(self):
         if 'APIs' in self.config:
             for name, details in self.config['APIs'].items():
-                url, key = details.split(',')
-                self.api_list.insert(tk.END, f"{name}: {url}")
+                model, url, key = details.split(',')
+                self.api_tree.insert('', 'end', values=(name, model, url, key))
 
     def load_target_language(self):
         if 'Settings' in self.config and 'target_language' in self.config['Settings']:
@@ -164,28 +298,52 @@ class TranslationGUI:
 
     def add_api(self):
         name = self.name_entry.get()
+        model = self.model_entry.get()
         url = self.url_entry.get()
         key = self.key_entry.get()
-        if name and url:
+        if name and model and url:  # Key is not checked here
             if 'APIs' not in self.config:
                 self.config['APIs'] = {}
-            self.config['APIs'][name] = f"{url},{key}"
+            self.config['APIs'][name] = f"{model},{url},{key}"
             save_config(self.config)
-            self.api_list.insert(tk.END, f"{name}: {url}")
+            self.api_tree.insert('', 'end', values=(name, model, url, key))
             self.name_entry.delete(0, tk.END)
+            self.model_entry.delete(0, tk.END)
             self.url_entry.delete(0, tk.END)
             self.key_entry.delete(0, tk.END)
         else:
-            messagebox.showerror("Error", "Please fill all fields")
+            messagebox.showerror("Error", "Please fill Name, Model, and URL fields")
+
+    def edit_api(self):
+        selection = self.api_tree.selection()
+        if selection:
+            item = selection[0]
+            old_name = self.api_tree.item(item, 'values')[0]
+            new_name = self.name_entry.get()
+            model = self.model_entry.get()
+            url = self.url_entry.get()
+            key = self.key_entry.get()
+            if new_name and model and url:  # Key is not checked here
+                # Update config
+                del self.config['APIs'][old_name]
+                self.config['APIs'][new_name] = f"{model},{url},{key}"
+                save_config(self.config)
+                # Update treeview
+                self.api_tree.item(item, values=(new_name, model, url, key))
+                messagebox.showinfo("Success", "API updated successfully")
+            else:
+                messagebox.showerror("Error", "Please fill Name, Model, and URL fields")
+        else:
+            messagebox.showerror("Error", "Please select an API to edit")
 
     def delete_api(self):
-        selection = self.api_list.curselection()
+        selection = self.api_tree.selection()
         if selection:
-            index = selection[0]
-            name = self.api_list.get(index).split(':')[0]
+            item = selection[0]
+            name = self.api_tree.item(item, 'values')[0]
             del self.config['APIs'][name]
             save_config(self.config)
-            self.api_list.delete(index)
+            self.api_tree.delete(item)
         else:
             messagebox.showerror("Error", "Please select an API to delete")
 
@@ -207,7 +365,7 @@ class TranslationGUI:
         input_file = Path(self.input_entry.get())
         output_file = Path(self.output_entry.get())
         target_language = self.lang_entry.get()
-        selection = self.api_list.curselection()
+        selection = self.api_tree.selection()
         
         if not input_file or not output_file or not target_language:
             messagebox.showerror("Error", "Please fill all fields")
@@ -229,8 +387,8 @@ class TranslationGUI:
             messagebox.showerror("Error", error_message)
             return
 
-        name = self.api_list.get(selection[0]).split(':')[0]
-        url, key = self.config['APIs'][name].split(',')
+        item = selection[0]
+        name, model, url, key = self.api_tree.item(item, 'values')
 
         # Save target language to config
         if 'Settings' not in self.config:
@@ -238,15 +396,36 @@ class TranslationGUI:
         self.config['Settings']['target_language'] = target_language
         save_config(self.config)
 
-        try:
-            translate_document(input_file, output_file, url, key, target_language)
-            messagebox.showinfo("Success", "Translation complete!")
-            if self.open_var.get():
-                os.startfile(str(output_file))
-        except Exception as e:
-            error_message = f"An error occurred: {str(e)}"
-            logging.error(error_message)
-            messagebox.showerror("Error", error_message)
+        def translation_thread():
+            try:
+                translate_document(input_file, output_file, url, key, target_language, model, self.update_progress)
+                messagebox.showinfo("Success", "Translation complete!")
+                if self.open_var.get():
+                    os.startfile(str(output_file))
+            except Exception as e:
+                error_message = f"An error occurred: {str(e)}"
+                logging.error(error_message)
+                messagebox.showerror("Error", error_message)
+            finally:
+                self.progress_var.set(0)
+                self.status_var.set("")
+        
+        thread = threading.Thread(target=translation_thread)
+        thread.start()
+
+    def on_api_select(self, event):
+        selection = self.api_tree.selection()
+        if selection:
+            item = selection[0]
+            name, model, url, key = self.api_tree.item(item, 'values')
+            self.name_entry.delete(0, tk.END)
+            self.name_entry.insert(0, name)
+            self.model_entry.delete(0, tk.END)
+            self.model_entry.insert(0, model)
+            self.url_entry.delete(0, tk.END)
+            self.url_entry.insert(0, url)
+            self.key_entry.delete(0, tk.END)
+            self.key_entry.insert(0, key)
 
 if __name__ == "__main__":
     root = tk.Tk()
