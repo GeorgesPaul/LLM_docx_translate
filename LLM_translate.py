@@ -254,7 +254,6 @@ class TranslationGUI:
     def update_progress(self, value, status):
         self.progress_var.set(value)
         self.status_var.set(status)
-        self.master.update_idletasks()
 
     def create_widgets(self):
         # API List
@@ -309,12 +308,12 @@ class TranslationGUI:
         self.file_frame.pack(padx=10, pady=5, fill=tk.X)
 
         ttk.Label(self.file_frame, text="Input File:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-        self.input_entry = ttk.Entry(self.file_frame, width=90)
+        self.input_entry = ttk.Entry(self.file_frame, width=95)
         self.input_entry.grid(row=0, column=1, padx=5, pady=2)
         ttk.Button(self.file_frame, text="Browse", command=self.browse_input).grid(row=0, column=2, padx=5, pady=2)
 
         ttk.Label(self.file_frame, text="Output File:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        self.output_entry = ttk.Entry(self.file_frame, width=90)
+        self.output_entry = ttk.Entry(self.file_frame, width=95)
         self.output_entry.grid(row=1, column=1, padx=5, pady=2)
 
         # Target Language
@@ -430,10 +429,8 @@ class TranslationGUI:
         except queue.Empty:
             pass
         finally:
-            if not self.queue.empty():
-                self.master.after(500, self.check_queue)
-            else:
-                self.reset_progress()
+            if not self.shutdown_flag.is_set():
+                self.master.after(100, self.check_queue)
 
     def do_translation(self):
         input_file = Path(self.input_entry.get())
@@ -486,6 +483,7 @@ class TranslationGUI:
 
         thread = Thread(target=translation_thread)
         thread.start()
+        self.check_queue()  # Start checking the queue
 
     def on_api_select(self, event):
         selection = self.api_tree.selection()
