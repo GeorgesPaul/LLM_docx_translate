@@ -17,12 +17,14 @@ import sys
 import re
 from copy import deepcopy
 from urllib.parse import urlparse
+from requests.exceptions import Timeout, RequestException
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 
 logging.basicConfig(filename='translation_log.txt', level=logging.DEBUG)
 CONFIG_FILE = 'translation_config.ini'
 
-LLM_response_timeout_s = 10 
+LLM_response_timeout_s = 20
 
 def load_config():
     config = configparser.ConfigParser()
@@ -37,7 +39,13 @@ def save_config(config):
 def contains_words(text):
     return len(text.strip()) > 1 and bool(re.search(r'\w', text))
 
-def translate_text(text, api_url, api_key, target_language, model, timeout=10, shutdown_flag=None):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def make_api_request(api_url, headers, payload, timeout):
+    response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+def translate_text(text, api_url, api_key, target_language, model, timeout=LLM_response_timeout_s, shutdown_flag=None):
     if not contains_words(text):
         return text  # Return the original text if it doesn't contain any word characters
     if shutdown_flag and shutdown_flag.is_set():
@@ -68,8 +76,7 @@ def translate_text(text, api_url, api_key, target_language, model, timeout=10, s
         }
 
     try:
-        response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=timeout)
-        response.raise_for_status()
+        response = make_api_request(api_url, headers, payload, timeout)
         
         # Check if the response is a single JSON object
         content_type = response.headers.get('Content-Type', '')
@@ -104,7 +111,7 @@ def translate_text(text, api_url, api_key, target_language, model, timeout=10, s
         print(full_response.strip())
         return full_response.strip()
 
-    except requests.exceptions.Timeout:
+    except Timeout:
         error_message = "API request timed out"
         logging.error(error_message)
         raise
